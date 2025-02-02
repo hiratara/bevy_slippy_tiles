@@ -120,13 +120,60 @@ impl Default for ActiveDownloads {
     }
 }
 
+#[derive(Resource, Default)]
+pub(crate) struct DownloadSlippyTask(Vec<Task<DownloadSlippyTaskEntry>>);
+
+impl DownloadSlippyTask {
+    fn push(&mut self, task: Task<DownloadSlippyTaskEntry>) {
+        self.0.push(task);
+    }
+
+    fn retain_mut<F: FnMut(&mut Task<DownloadSlippyTaskEntry>) -> bool>(&mut self, f: F) {
+        self.0.retain_mut(f);
+    }
+}
+
+struct DownloadSlippyTaskEntry {
+    spc: SlippyTileCoordinates,
+    zoom_level: ZoomLevel,
+    tile_size: TileSize,
+    filename: String,
+    use_cache: UseCache,
+    already_downloaded: AlreadyDownloaded,
+    file_exists: FileExists,
+}
+
+impl DownloadSlippyTaskEntry {
+    fn new(
+        spc: SlippyTileCoordinates,
+        zoom_level: ZoomLevel,
+        tile_size: TileSize,
+        filename: String,
+        use_cache: UseCache,
+        already_downloaded: AlreadyDownloaded,
+        file_exists: FileExists,
+    ) -> Self {
+        Self {
+            spc,
+            zoom_level,
+            tile_size,
+            filename,
+            use_cache,
+            already_downloaded,
+            file_exists,
+        }
+    }
+}
+
 /// System that listens for DownloadSlippyTiles events and submits individual tile requests in separate threads.
-pub fn download_slippy_tiles(
+#[allow(clippy::too_many_arguments)]
+pub fn start_download_slippy_tiles(
     mut download_slippy_tile_events: EventReader<DownloadSlippyTilesEvent>,
     slippy_tiles_settings: Res<SlippyTilesSettings>,
     mut slippy_tile_download_status: ResMut<SlippyTileDownloadStatus>,
     mut slippy_tile_download_tasks: ResMut<SlippyTileDownloadTasks>,
     mut rate_limiter: ResMut<DownloadRateLimiter>,
+    mut download_slippy_task: ResMut<DownloadSlippyTask>,
     active_downloads: Res<ActiveDownloads>,
     asset_server: Res<AssetServer>,
 ) {
@@ -188,85 +235,23 @@ pub fn download_slippy_tiles(
                     download_slippy_tile.tile_size,
                 );
 
-                let file_exists = async_file_exists(&asset_server, &filename);
-
-                match (
-                    UseCache::new(download_slippy_tile.use_cache),
-                    AlreadyDownloaded::new(already_downloaded),
-                    FileExists::new(file_exists),
-                ) {
-                    // This should only match when waiting on a file download.
-                    (_, AlreadyDownloaded::Yes, FileExists::No) => {
-                        // Check if the download has timed out
-                        if let Some(status) = slippy_tile_download_status.0.get(&SlippyTileDownloadTaskKey {
-                            slippy_tile_coordinates: spc,
-                            zoom_level: download_slippy_tile.zoom_level,
-                            tile_size: download_slippy_tile.tile_size,
-                        }) {
-                            if matches!(status.load_status, DownloadStatus::Downloading) {
-                                // Re-download if timed out
-                                if !rate_limiter.can_make_request(Instant::now(), &slippy_tiles_settings) {
-                                    rate_limiter.buffer_request(
-                                        (x, y),
-                                        download_slippy_tile.zoom_level,
-                                        download_slippy_tile.tile_size,
-                                        slippy_tiles_settings.endpoint.clone(),
-                                        filename,
-                                    );
-                                } else {
-                                    download_and_track_slippy_tile(
-                                        spc,
-                                        download_slippy_tile.zoom_level,
-                                        download_slippy_tile.tile_size,
-                                        slippy_tiles_settings.endpoint.clone(),
-                                        filename,
-                                        &mut slippy_tile_download_tasks,
-                                        &mut slippy_tile_download_status,
-                                        &asset_server,
-                                        &active_downloads,
-                                        &slippy_tiles_settings,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    // Cache can not be used,
-                    (UseCache::No, _, _)
-                    // OR not downloading yet and no file exists on disk.
-                    | (UseCache::Yes, AlreadyDownloaded::No, FileExists::No) => {
-                        if !rate_limiter.can_make_request(Instant::now(), &slippy_tiles_settings) {
-                            rate_limiter.buffer_request(
-                                (x, y),
-                                download_slippy_tile.zoom_level,
-                                download_slippy_tile.tile_size,
-                                slippy_tiles_settings.endpoint.clone(),
-                                filename,
-                            );
-                        } else {
-                            download_and_track_slippy_tile(
-                                spc,
-                                download_slippy_tile.zoom_level,
-                                download_slippy_tile.tile_size,
-                                slippy_tiles_settings.endpoint.clone(),
-                                filename,
-                                &mut slippy_tile_download_tasks,
-                                &mut slippy_tile_download_status,
-                                &asset_server,
-                                &active_downloads,
-                                &slippy_tiles_settings,
-                            );
-                        }
-                    }
-                    // Cache can be used and we have the file on disk.
-                    (UseCache::Yes, _, FileExists::Yes) => load_and_track_slippy_tile_from_disk(
+                let asset_server = asset_server.clone();
+                let use_cache = download_slippy_tile.use_cache;
+                let zoom_level = download_slippy_tile.zoom_level;
+                let tile_size = download_slippy_tile.tile_size;
+                let task = IoTaskPool::get().spawn(async move {
+                    let file_exists = async_file_exists(asset_server, filename.clone()).await;
+                    DownloadSlippyTaskEntry::new(
                         spc,
-                        download_slippy_tile.zoom_level,
-                        download_slippy_tile.tile_size,
+                        zoom_level,
+                        tile_size,
                         filename,
-                        &mut slippy_tile_download_tasks,
-                        &mut slippy_tile_download_status,
-                    ),
-                }
+                        UseCache::new(use_cache),
+                        AlreadyDownloaded::new(already_downloaded),
+                        FileExists::new(file_exists),
+                    )
+                });
+                download_slippy_task.push(task);
             }
         }
     }
@@ -289,18 +274,116 @@ fn get_tile_filename(
     )
 }
 
-fn async_file_exists(asset_server: &AssetServer, filename: &str) -> bool {
+async fn async_file_exists(asset_server: AssetServer, filename: String) -> bool {
     let asset_source = match asset_server.get_source(AssetSourceId::Default) {
         Ok(source) => source,
         Err(_) => return false,
     };
 
     let asset_reader = asset_source.reader();
-    match future::block_on(asset_reader.read(Path::new(filename))) {
+    match asset_reader.read(Path::new(&filename)).await {
         Ok(_) => true,
         Err(AssetReaderError::NotFound(_)) => false,
         Err(_) => false,
     }
+}
+
+/// System that listens for DownloadSlippyTiles events and submits individual tile requests in separate threads.
+#[allow(clippy::too_many_arguments)]
+pub fn download_slippy_tiles(
+    slippy_tiles_settings: Res<SlippyTilesSettings>,
+    mut slippy_tile_download_status: ResMut<SlippyTileDownloadStatus>,
+    mut slippy_tile_download_tasks: ResMut<SlippyTileDownloadTasks>,
+    mut rate_limiter: ResMut<DownloadRateLimiter>,
+    mut download_slippy_task: ResMut<DownloadSlippyTask>,
+    active_downloads: Res<ActiveDownloads>,
+    asset_server: Res<AssetServer>,
+) {
+    // let file_exists = future::block_on(async_file_exists(&asset_server, &filename));
+
+    download_slippy_task.retain_mut(|task| {
+        let download_slippy_task_entry = match future::block_on(future::poll_once(task)) {
+            Some(e) => e,
+            None => return true,
+        };
+        match (
+        download_slippy_task_entry.use_cache,
+        download_slippy_task_entry.already_downloaded,
+        download_slippy_task_entry.file_exists,
+    ) {        // This should only match when waiting on a file download.
+        (_, AlreadyDownloaded::Yes, FileExists::No) => {
+             // Check if the download has timed out
+            if let Some(status) = slippy_tile_download_status.0.get(&SlippyTileDownloadTaskKey {
+                slippy_tile_coordinates: download_slippy_task_entry.spc,
+                zoom_level: download_slippy_task_entry.zoom_level,
+                tile_size: download_slippy_task_entry.tile_size,
+            }) {
+                if matches!(status.load_status, DownloadStatus::Downloading) {
+                    // Re-download if timed out
+                    if !rate_limiter.can_make_request(Instant::now(), &slippy_tiles_settings) {
+                        rate_limiter.buffer_request(
+                            ( download_slippy_task_entry.spc.x,  download_slippy_task_entry.spc.y),
+                            download_slippy_task_entry.zoom_level,
+                            download_slippy_task_entry.tile_size,
+                            slippy_tiles_settings.endpoint.clone(),
+                            download_slippy_task_entry.filename,
+                        );
+                    } else {
+                        download_and_track_slippy_tile(
+                            download_slippy_task_entry.spc,
+                            download_slippy_task_entry.zoom_level,
+                            download_slippy_task_entry.tile_size,
+                            slippy_tiles_settings.endpoint.clone(),
+                            download_slippy_task_entry.filename,
+                            &mut slippy_tile_download_tasks,
+                            &mut slippy_tile_download_status,
+                            &asset_server,
+                            &active_downloads,
+                            &slippy_tiles_settings,
+                        );
+                    }
+                }
+            }
+        }
+        // Cache can not be used,
+        (UseCache::No, _, _)
+        // OR not downloading yet and no file exists on disk.
+        | (UseCache::Yes, AlreadyDownloaded::No, FileExists::No) => {
+            if !rate_limiter.can_make_request(Instant::now(), &slippy_tiles_settings) {
+                rate_limiter.buffer_request(
+                    ( download_slippy_task_entry.spc.x,  download_slippy_task_entry.spc.y),
+                    download_slippy_task_entry.zoom_level,
+                    download_slippy_task_entry.tile_size,
+                    slippy_tiles_settings.endpoint.clone(),
+                    download_slippy_task_entry.filename,
+                );
+            } else {
+                download_and_track_slippy_tile(
+                    download_slippy_task_entry.spc,
+                    download_slippy_task_entry.zoom_level,
+                    download_slippy_task_entry.tile_size,
+                    slippy_tiles_settings.endpoint.clone(),
+                    download_slippy_task_entry.filename,
+                    &mut slippy_tile_download_tasks,
+                    &mut slippy_tile_download_status,
+                    &asset_server,
+                    &active_downloads,
+                    &slippy_tiles_settings,
+                );
+            }
+        }
+        // Cache can be used and we have the file on disk.
+        (UseCache::Yes, _, FileExists::Yes) => load_and_track_slippy_tile_from_disk(
+            download_slippy_task_entry.spc,
+            download_slippy_task_entry.zoom_level,
+            download_slippy_task_entry.tile_size,
+            download_slippy_task_entry.filename,
+            &mut slippy_tile_download_tasks,
+            &mut slippy_tile_download_status,
+        ),
+    };
+        false
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

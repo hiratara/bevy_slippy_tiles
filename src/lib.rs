@@ -25,8 +25,10 @@ impl Plugin for SlippyTilesPlugin {
             .insert_resource(SlippyTileDownloadTasks::new())
             .insert_resource(systems::DownloadRateLimiter::default())
             .insert_resource(systems::ActiveDownloads::default())
+            .init_resource::<systems::DownloadSlippyTask>()
             .add_event::<DownloadSlippyTilesEvent>()
             .add_event::<SlippyTileDownloadedEvent>()
+            .add_systems(Update, systems::start_download_slippy_tiles)
             .add_systems(Update, systems::download_slippy_tiles)
             .add_systems(Update, systems::download_slippy_tiles_completed)
             .add_systems(Update, display::display_tiles);
